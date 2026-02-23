@@ -5,30 +5,48 @@ import 'dart:typed_data';
 import 'src/models.dart';
 import 'src/supervisor.dart';
 
-export 'src/models.dart' show HydrationError;
+export 'src/models.dart' show HydrationError, HydrationProgress;
 
-/// High-performance JSON hydrator for fintech payloads.
 class FintechHydrator<T> {
   static const int _defaultChunkSize = 20;
   static const int _gatekeeperThresholdBytes = 50 * 1024; // 50KB
 
   final StreamController<List<T>> _controller = StreamController<List<T>>();
+  final StreamController<HydrationProgress> _progressController =
+      StreamController<HydrationProgress>();
   final List<T> _accumulated = [];
 
-  /// The stream of accumulated data.
+  StreamSubscription? _subscription;
+  ReceivePort? _receivePort;
+  bool _isCancelled = false;
+
   Stream<List<T>> get onData => _controller.stream;
 
-  /// Creates a new hydrator and starts the process.
+  Stream<HydrationProgress> get onProgress => _progressController.stream;
+
   FintechHydrator({
-    required String payload,
+    String? payload,
+    Uint8List? bytes,
     required T Function(Map<String, dynamic>) mapper,
     int chunkSize = _defaultChunkSize,
+    int? maxFrameWorkMs,
   }) {
-    if (payload.length < _gatekeeperThresholdBytes) {
-      _parseOnMainThread(payload, mapper, chunkSize);
+    final Uint8List finalBytes = bytes ?? utf8.encode(payload ?? '');
+
+    if (finalBytes.length < _gatekeeperThresholdBytes) {
+      _parseOnMainThread(utf8.decode(finalBytes), mapper, chunkSize);
     } else {
-      _parseOnWorkerIsolate(payload, mapper, chunkSize);
+      _parseOnWorkerIsolate(finalBytes, mapper, chunkSize, maxFrameWorkMs);
     }
+  }
+
+  void cancel() {
+    if (_isCancelled) return;
+    _isCancelled = true;
+    _subscription?.cancel();
+    _receivePort?.close();
+    if (!_controller.isClosed) _controller.close();
+    if (!_progressController.isClosed) _progressController.close();
   }
 
   void _parseOnMainThread(
@@ -41,11 +59,16 @@ class FintechHydrator<T> {
       if (decoded is! List) {
         _controller.addError(HydrationError('JSON root must be a List'));
         _controller.close();
+        _progressController.close();
         return;
       }
 
       final List<dynamic> list = decoded;
+      final int totalItems = list.length;
+
       for (int i = 0; i < list.length; i += chunkSize) {
+        if (_isCancelled) return;
+
         final end = (i + chunkSize < list.length) ? i + chunkSize : list.length;
         final chunk = list.sublist(i, end);
 
@@ -53,55 +76,69 @@ class FintechHydrator<T> {
             .map((e) => mapper(e as Map<String, dynamic>))
             .toList();
         _accumulated.addAll(mapped);
-        _controller.add(List<T>.from(_accumulated));
+
+        // Unmodifiable view instead of deep copy — O(1) vs O(n)
+        _controller.add(List<T>.unmodifiable(_accumulated));
+        _progressController.add(
+          HydrationProgress(
+            loadedItems: _accumulated.length,
+            totalItems: totalItems,
+          ),
+        );
       }
       _controller.close();
+      _progressController.close();
     } catch (e, stack) {
       _controller.addError(
         HydrationError('Main thread parse failed', e, stack),
       );
       _controller.close();
+      _progressController.close();
     }
   }
 
   Future<void> _parseOnWorkerIsolate(
-    String rawJson,
+    Uint8List bytes,
     T Function(Map<String, dynamic>) mapper,
     int chunkSize,
+    int? maxFrameWorkMs,
   ) async {
     final supervisor = IsolateSupervisor();
     await supervisor.ensureReady();
 
-    final receivePort = ReceivePort();
+    _receivePort = ReceivePort();
 
-    // Use TransferableTypedData to avoid copying large strings
-    final bytes = utf8.encode(rawJson);
-    final transferable = TransferableTypedData.fromList([
-      Uint8List.fromList(bytes),
-    ]);
+    final transferable = TransferableTypedData.fromList([bytes]);
 
     final request = HydrationRequest<T>(
       payload: transferable,
       decoder: mapper,
       chunkSize: chunkSize,
-      replyPort: receivePort.sendPort,
+      maxFrameWorkMs: maxFrameWorkMs,
+      replyPort: _receivePort!.sendPort,
     );
 
-    StreamSubscription? subscription;
-    subscription = receivePort.listen((message) {
+    _subscription = _receivePort!.listen((message) {
+      if (_isCancelled) return;
+
       if (message is HydrationResponse) {
         if (message.error != null) {
           _controller.addError(message.error!);
-          subscription?.cancel();
-          receivePort.close();
-          _controller.close();
+          _cleanup();
         } else if (message.isComplete) {
-          subscription?.cancel();
-          receivePort.close();
-          _controller.close();
+          _cleanup();
         } else if (message.items != null) {
           _accumulated.addAll(List<T>.from(message.items!));
-          _controller.add(List<T>.from(_accumulated));
+          _controller.add(List<T>.unmodifiable(_accumulated));
+
+          if (message.totalItems != null) {
+            _progressController.add(
+              HydrationProgress(
+                loadedItems: _accumulated.length,
+                totalItems: message.totalItems!,
+              ),
+            );
+          }
         }
       }
     });
@@ -109,7 +146,13 @@ class FintechHydrator<T> {
     supervisor.send(request);
   }
 
-  /// Global cleanup for the isolate supervisor.
+  void _cleanup() {
+    _subscription?.cancel();
+    _receivePort?.close();
+    if (!_controller.isClosed) _controller.close();
+    if (!_progressController.isClosed) _progressController.close();
+  }
+
   static void dispose() {
     IsolateSupervisor().dispose();
   }

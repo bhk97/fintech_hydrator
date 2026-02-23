@@ -1,10 +1,10 @@
 import 'dart:async';
 import 'dart:isolate';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'models.dart';
 import 'worker.dart';
 
-/// Manages the lifecycle of the long-lived background isolate.
 class IsolateSupervisor {
   static final IsolateSupervisor _instance = IsolateSupervisor._internal();
   factory IsolateSupervisor() => _instance;
@@ -12,20 +12,26 @@ class IsolateSupervisor {
 
   Isolate? _isolate;
   SendPort? _sendPort;
-  final _readyCompleter = Completer<void>();
+  Completer<void>? _readyCompleter;
   Timer? _heartbeatTimer;
   DateTime _lastHeartbeat = DateTime.now();
   bool _isRestarting = false;
 
   Future<void> ensureReady() async {
     if (_isolate != null && _sendPort != null && !_isRestarting) return;
-    if (_readyCompleter.isCompleted && !_isRestarting) return;
+
+    // If there's already a pending start, wait for it instead of starting again
+    if (_readyCompleter != null && !_readyCompleter!.isCompleted) {
+      return _readyCompleter!.future;
+    }
 
     await _start();
-    return _readyCompleter.future;
+    return _readyCompleter!.future;
   }
 
   Future<void> _start() async {
+    _readyCompleter = Completer<void>();
+
     final receivePort = ReceivePort();
     final token = RootIsolateToken.instance;
 
@@ -44,9 +50,7 @@ class IsolateSupervisor {
     });
 
     _sendPort = await completer.future;
-    if (!_readyCompleter.isCompleted) {
-      _readyCompleter.complete();
-    }
+    _readyCompleter!.complete();
     _isRestarting = false;
     _startHeartbeatMonitor();
   }
@@ -55,7 +59,7 @@ class IsolateSupervisor {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
       if (DateTime.now().difference(_lastHeartbeat).inSeconds > 5) {
-        print('FintechHydrator: Isolate heartbeat lost. Restarting...');
+        debugPrint('FintechHydrator: Isolate heartbeat lost. Restarting...');
         restart();
       }
     });

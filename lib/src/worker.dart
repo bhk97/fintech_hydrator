@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
-import 'dart:typed_data';
 import 'package:flutter/services.dart';
 import 'models.dart';
 
@@ -18,14 +17,17 @@ class HydrationWorker {
     final workerReceivePort = ReceivePort();
     mainSendPort.send(workerReceivePort.sendPort);
 
-    // Heartbeat mechanism
-    Timer.periodic(const Duration(seconds: 1), (timer) {
+    // Heartbeat mechanism — track timer so it can be cleaned up
+    final heartbeatTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       mainSendPort.send(HydrationResponse.heartbeat());
     });
 
     workerReceivePort.listen((message) async {
       if (message is HydrationRequest) {
         await _handleRequest(message);
+      } else if (message == 'shutdown') {
+        heartbeatTimer.cancel();
+        workerReceivePort.close();
       }
     });
   }
@@ -65,7 +67,17 @@ class HydrationWorker {
               .map((item) => request.decoder(item as Map<String, dynamic>))
               .toList();
 
-          request.replyPort.send(HydrationResponse.chunk(mappedChunk));
+          // Send totalItems with every chunk so the main isolate can track progress
+          request.replyPort.send(
+            HydrationResponse.chunk(mappedChunk, totalItems: totalItems),
+          );
+
+          // Throttled Delivery: Wait for next frame (Zero Jank)
+          // Default to 8ms if requested but not specified
+          if (request.maxFrameWorkMs != null || totalItems > 1000) {
+            final delay = request.maxFrameWorkMs ?? 8;
+            await Future.delayed(Duration(milliseconds: delay));
+          }
         } catch (e, stack) {
           request.replyPort.send(
             HydrationResponse.error(

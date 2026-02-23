@@ -64,9 +64,10 @@ void main() async {
   final completer = Completer<void>();
 
   final hydrator = FintechHydrator<Transaction>(
-    payload: rawJson,
+    bytes: utf8.encode(rawJson),
     mapper: Transaction.fromJson,
     chunkSize: 20,
+    maxFrameWorkMs: 4,
   );
 
   hydrator.onData.listen(
